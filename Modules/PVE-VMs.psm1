@@ -185,7 +185,8 @@ function Get-PVEVMPowerState {
         [Parameter(Mandatory, ValueFromPipelineByPropertyName)][string]$ClusterName,
         [string]$Name
     )
-    Get-PVEVMs -ClusterName $ClusterName -Name ($Name ?? '*') |
+    $nameFilter = if ($Name) { $Name } else { '*' }
+    Get-PVEVMs -ClusterName $ClusterName -Name $nameFilter |
         Select-Object Node, VMID, Name, Status, UptimeH
 }
 
@@ -248,4 +249,451 @@ function Get-PVESnapshots {
     $results | Sort-Object VM, Created
 }
 
-Export-ModuleMember -Function Get-PVENodes, Get-PVEVMs, Get-PVEVMDisk, Get-PVEVMsByStorage, Get-PVEStorage, Get-PVEVMPowerState, Get-PVESnapshots
+# ═══════════════════════════════════════════════════════
+# NEW FUNCTIONS — VM Details
+# ═══════════════════════════════════════════════════════
+
+function Get-PVEVMConfig {
+    <#
+    .SYNOPSIS Full configuration of a VM: CPU type, BIOS, boot, NICs, disks, tags, description.
+    .EXAMPLE
+        Get-PVEVMConfig -ClusterName THC -VMIDorName 'thcwpexch01'
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][Alias('VMID','Name')][string]$VMIDorName,
+        [string]$Node
+    )
+    if ($VMIDorName -match '^\d+$') {
+        $vmid = [int]$VMIDorName
+        if (-not $Node) { throw "Pass -Node when using VMID directly." }
+    } else {
+        $vm   = Get-PVEVMs -ClusterName $ClusterName -Name $VMIDorName | Select-Object -First 1
+        if (-not $vm) { throw "VM '$VMIDorName' not found." }
+        $vmid = $vm.VMID; if (-not $Node) { $Node = $vm.Node }
+    }
+    $cfg = _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/qemu/$vmid/config"
+    $cfg | Add-Member -NotePropertyName _VMName -NotePropertyValue $VMIDorName -PassThru |
+           Add-Member -NotePropertyName _Node   -NotePropertyValue $Node       -PassThru
+}
+
+function Get-PVEVMStatus {
+    <#
+    .SYNOPSIS Live CPU%, RAM used, PID, uptime, lock for a running VM.
+    .EXAMPLE
+        Get-PVEVMStatus -ClusterName THC -VMIDorName 'thcwpexch01'
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][Alias('VMID','Name')][string]$VMIDorName,
+        [string]$Node
+    )
+    if ($VMIDorName -match '^\d+$') {
+        $vmid = [int]$VMIDorName
+        if (-not $Node) { throw "Pass -Node when using VMID directly." }
+    } else {
+        $vm   = Get-PVEVMs -ClusterName $ClusterName -Name $VMIDorName | Select-Object -First 1
+        if (-not $vm) { throw "VM '$VMIDorName' not found." }
+        $vmid = $vm.VMID; if (-not $Node) { $Node = $vm.Node }
+    }
+    $s = _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/qemu/$vmid/status/current"
+    [PSCustomObject]@{
+        Name      = $s.name
+        VMID      = $vmid
+        Node      = $Node
+        Status    = $s.status
+        CpuPct    = [math]::Round($s.cpu * 100, 2)
+        MemUsedGB = [math]::Round($s.mem / 1GB, 2)
+        MemMaxGB  = [math]::Round($s.maxmem / 1GB, 1)
+        MemPct    = if ($s.maxmem) { [math]::Round(($s.mem / $s.maxmem) * 100, 1) } else { 0 }
+        UptimeH   = [math]::Round($s.uptime / 3600, 1)
+        PID       = $s.pid
+        Lock      = $s.lock
+        QmpStatus = $s.qmpstatus
+        Tags      = $s.tags
+    }
+}
+
+function Get-PVEClusterResources {
+    <#
+    .SYNOPSIS All cluster resources in one call: VMs, nodes, storage, LXC.
+    .PARAMETER Type  Filter: vm | node | storage | sdn | all (default: all)
+    .EXAMPLE
+        Get-PVEClusterResources -ClusterName THC
+        Get-PVEClusterResources -ClusterName THC -Type vm
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [ValidateSet('vm','node','storage','sdn','all')][string]$Type = 'all'
+    )
+    $path = '/cluster/resources'
+    if ($Type -ne 'all') { $path += "?type=$Type" }
+    _PVE-Invoke -ClusterName $ClusterName -Path $path
+}
+
+function Get-PVELXCList {
+    <#
+    .SYNOPSIS List LXC containers across all nodes.
+    .EXAMPLE
+        Get-PVELXCList -ClusterName THC
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [string]$Node,
+        [ValidateSet('running','stopped','all')][string]$Status = 'all'
+    )
+    $nodes = if ($Node) { @([PSCustomObject]@{node=$Node}) } else { _PVE-Invoke -ClusterName $ClusterName -Path '/nodes' }
+    $results = foreach ($n in $nodes) {
+        try {
+            $ctrs = _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$($n.node)/lxc"
+            foreach ($c in $ctrs) {
+                [PSCustomObject]@{
+                    ClusterName = $ClusterName
+                    Node     = $n.node
+                    CTID     = $c.vmid
+                    Name     = $c.name
+                    Status   = $c.status
+                    MemGB    = [math]::Round($c.maxmem/1GB, 1)
+                    CPUs     = $c.cpus
+                    DiskGB   = [math]::Round($c.maxdisk/1GB, 1)
+                    UptimeH  = if ($c.uptime) { [math]::Round($c.uptime/3600,1) } else { 0 }
+                }
+            }
+        } catch { }
+    }
+    $results = $results | Where-Object { $_ -ne $null }
+    if ($Status -ne 'all') { $results = $results | Where-Object { $_.Status -eq $Status } }
+    $results | Sort-Object Node, Name
+}
+
+function Get-PVENodeStatus {
+    <#
+    .SYNOPSIS Detailed CPU/RAM/swap/load/disk for a specific node.
+    .EXAMPLE
+        Get-PVENodeStatus -ClusterName THC -Node thclprhevh01
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][string]$Node
+    )
+    $s = _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/status"
+    [PSCustomObject]@{
+        Node        = $Node
+        CpuPct      = [math]::Round($s.cpu * 100, 2)
+        CPUs        = $s.cpuinfo.cpus
+        CpuModel    = $s.cpuinfo.model
+        MemUsedGB   = [math]::Round($s.memory.used/1GB,1)
+        MemTotalGB  = [math]::Round($s.memory.total/1GB,1)
+        SwapUsedGB  = [math]::Round($s.swap.used/1GB,1)
+        SwapTotalGB = [math]::Round($s.swap.total/1GB,1)
+        RootUsedGB  = [math]::Round($s.rootfs.used/1GB,1)
+        RootTotalGB = [math]::Round($s.rootfs.total/1GB,1)
+        Load1m      = $s.loadavg[0]
+        Load5m      = $s.loadavg[1]
+        Load15m     = $s.loadavg[2]
+        KernelVer   = $s.kversion
+        PVEVersion  = $s.pveversion
+        UptimeH     = [math]::Round($s.uptime/3600,1)
+    }
+}
+
+function Get-PVENodeNetwork {
+    <#
+    .SYNOPSIS All NICs and bridges on a node (name, type, IP, MAC, bridge members).
+    .EXAMPLE
+        Get-PVENodeNetwork -ClusterName THC -Node thclprhevh01
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][string]$Node
+    )
+    _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/network" |
+        Select-Object iface, type, active, autostart,
+            @{N='IP';E={$_.address}},
+            @{N='Netmask';E={$_.netmask}},
+            @{N='Gateway';E={$_.gateway}},
+            @{N='MAC';E={$_.'hardware-address'}},
+            @{N='BridgePorts';E={$_.'bridge-ports'}},
+            @{N='BridgeSTP';E={$_.'bridge-stp'}},
+            comments |
+        Sort-Object type, iface
+}
+
+function Get-PVENodeDisks {
+    <#
+    .SYNOPSIS Physical disks on a node (model, serial, size, type, health).
+    .EXAMPLE
+        Get-PVENodeDisks -ClusterName THC -Node thclprhevh01
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][string]$Node
+    )
+    _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/disks/list" |
+        Select-Object devpath, model, serial, vendor, size,
+            @{N='SizeGB';E={[math]::Round($_.size/1GB,0)}},
+            type, health, rpm, wearout |
+        Sort-Object devpath
+}
+
+function Get-PVEStorageContent {
+    <#
+    .SYNOPSIS List content of a storage pool: ISOs, VM images, backups, templates.
+    .PARAMETER ContentType  Filter: images | iso | backup | vztmpl | all (default: all)
+    .EXAMPLE
+        Get-PVEStorageContent -ClusterName THC -Node thclprhevh01 -StorageName local
+        Get-PVEStorageContent -ClusterName THC -Node thclprhevh01 -StorageName nfs_proxmox_hrz01 -ContentType backup
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][string]$Node,
+        [Parameter(Mandatory)][string]$StorageName,
+        [ValidateSet('images','iso','backup','vztmpl','all')][string]$ContentType = 'all'
+    )
+    $path = "/nodes/$Node/storage/$StorageName/content"
+    if ($ContentType -ne 'all') { $path += "?content=$ContentType" }
+    _PVE-Invoke -ClusterName $ClusterName -Path $path |
+        Select-Object volid, content, format,
+            @{N='SizeGB';E={[math]::Round($_.size/1GB,2)}},
+            vmid, notes, ctime |
+        Sort-Object content, volid
+}
+
+function Get-PVEClusterTasks {
+    <#
+    .SYNOPSIS Cluster task history: migrations, backups, clone, snapshots, etc.
+    .PARAMETER Limit  Max tasks to return (default: 50)
+    .EXAMPLE
+        Get-PVEClusterTasks -ClusterName THC -Limit 20
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [int]$Limit = 50
+    )
+    _PVE-Invoke -ClusterName $ClusterName -Path "/cluster/tasks" |
+        Select-Object -First $Limit |
+        Select-Object upid, type, user, node, status,
+            @{N='StartTime';E={ [DateTimeOffset]::FromUnixTimeSeconds($_.starttime).LocalDateTime.ToString('yyyy-MM-dd HH:mm:ss') }},
+            @{N='EndTime';E={ if ($_.endtime) { [DateTimeOffset]::FromUnixTimeSeconds($_.endtime).LocalDateTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '-' } }},
+            id |
+        Sort-Object StartTime -Descending |
+        Select-Object -First $Limit
+}
+
+function Get-PVEBackupJobs {
+    <#
+    .SYNOPSIS List configured backup jobs (vzdump schedules).
+    .EXAMPLE
+        Get-PVEBackupJobs -ClusterName THC
+    #>
+    param([Parameter(Mandatory)][string]$ClusterName)
+    _PVE-Invoke -ClusterName $ClusterName -Path '/cluster/backup' |
+        Select-Object id, enabled, schedule, storage, node, vmid,
+            compress, mode, mailto, maxfiles, notes-template |
+        Sort-Object id
+}
+
+function Get-PVEHAStatus {
+    <#
+    .SYNOPSIS HA cluster status and HA-managed resources.
+    .EXAMPLE
+        Get-PVEHAStatus -ClusterName THC
+    #>
+    param([Parameter(Mandatory)][string]$ClusterName)
+    $status    = _PVE-Invoke -ClusterName $ClusterName -Path '/cluster/ha/status/current'
+    $resources = try { _PVE-Invoke -ClusterName $ClusterName -Path '/cluster/ha/resources' } catch { @() }
+    [PSCustomObject]@{
+        Status    = $status
+        Resources = $resources
+    }
+}
+
+function Get-PVEReplicationJobs {
+    <#
+    .SYNOPSIS List replication jobs (cross-node VM replication schedule).
+    .EXAMPLE
+        Get-PVEReplicationJobs -ClusterName THC
+    #>
+    param([Parameter(Mandatory)][string]$ClusterName)
+    _PVE-Invoke -ClusterName $ClusterName -Path '/cluster/replication' |
+        Select-Object id, type, source, target, vmid, schedule,
+            enabled, rate, remove_job, comment |
+        Sort-Object id
+}
+
+function Get-PVEFirewallRules {
+    <#
+    .SYNOPSIS Firewall rules for a node or a specific VM.
+    .PARAMETER VMIDorName  If provided, get VM-level rules. Otherwise node-level rules.
+    .EXAMPLE
+        Get-PVEFirewallRules -ClusterName THC -Node thclprhevh01
+        Get-PVEFirewallRules -ClusterName THC -Node thclprhevh01 -VMIDorName 'thcwpexch01'
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][string]$Node,
+        [string]$VMIDorName
+    )
+    if ($VMIDorName) {
+        if ($VMIDorName -match '^\d+$') { $vmid = [int]$VMIDorName }
+        else {
+            $vm = Get-PVEVMs -ClusterName $ClusterName -Name $VMIDorName | Select-Object -First 1
+            $vmid = $vm.VMID
+        }
+        _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/qemu/$vmid/firewall/rules"
+    } else {
+        _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/firewall/rules"
+    }
+}
+
+function Get-PVEVMAgent {
+    <#
+    .SYNOPSIS QEMU guest agent info: IPs, OS info, hostname (requires guest agent installed).
+    .EXAMPLE
+        Get-PVEVMAgent -ClusterName THC -VMIDorName 'thcwpexch01'
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][Alias('VMID','Name')][string]$VMIDorName,
+        [string]$Node
+    )
+    if ($VMIDorName -match '^\d+$') {
+        $vmid = [int]$VMIDorName
+        if (-not $Node) { throw "Pass -Node when using VMID directly." }
+    } else {
+        $vm   = Get-PVEVMs -ClusterName $ClusterName -Name $VMIDorName | Select-Object -First 1
+        if (-not $vm) { throw "VM '$VMIDorName' not found." }
+        $vmid = $vm.VMID; if (-not $Node) { $Node = $vm.Node }
+    }
+
+    $nics = try { _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/qemu/$vmid/agent/network-get-interfaces" } catch { $null }
+    $os   = try { _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/qemu/$vmid/agent/get-osinfo" }             catch { $null }
+    $host = try { _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/qemu/$vmid/agent/get-host-name" }         catch { $null }
+
+    [PSCustomObject]@{
+        VMName    = $VMIDorName
+        VMID      = $vmid
+        Node      = $Node
+        Hostname  = $host.result.'host-name'
+        OS        = $os.result
+        NICs      = $nics.result.'return'
+    }
+}
+
+function Get-PVEVMRRDData {
+    <#
+    .SYNOPSIS Historical metrics graph data: CPU, RAM, Net I/O, Disk I/O.
+    .PARAMETER Timeframe  hour | day | week | month | year (default: hour)
+    .EXAMPLE
+        Get-PVEVMRRDData -ClusterName THC -VMIDorName 'thcwpexch01' -Timeframe day
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][Alias('VMID','Name')][string]$VMIDorName,
+        [string]$Node,
+        [ValidateSet('hour','day','week','month','year')][string]$Timeframe = 'hour'
+    )
+    if ($VMIDorName -match '^\d+$') {
+        $vmid = [int]$VMIDorName
+        if (-not $Node) { throw "Pass -Node when using VMID directly." }
+    } else {
+        $vm   = Get-PVEVMs -ClusterName $ClusterName -Name $VMIDorName | Select-Object -First 1
+        if (-not $vm) { throw "VM '$VMIDorName' not found." }
+        $vmid = $vm.VMID; if (-not $Node) { $Node = $vm.Node }
+    }
+    _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/qemu/$vmid/rrddata?timeframe=$Timeframe&cf=AVERAGE"
+}
+
+function Get-PVENodeRRDData {
+    <#
+    .SYNOPSIS Historical metrics for a node (CPU, RAM, Net, Disk over time).
+    .PARAMETER Timeframe  hour | day | week | month | year (default: hour)
+    .EXAMPLE
+        Get-PVENodeRRDData -ClusterName THC -Node thclprhevh01 -Timeframe day
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][string]$Node,
+        [ValidateSet('hour','day','week','month','year')][string]$Timeframe = 'hour'
+    )
+    _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/rrddata?timeframe=$Timeframe&cf=AVERAGE"
+}
+
+function Get-PVENodeServices {
+    <#
+    .SYNOPSIS systemd services on a node (pveproxy, pvedaemon, pve-ha-*, etc.).
+    .EXAMPLE
+        Get-PVENodeServices -ClusterName THC -Node thclprhevh01
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][string]$Node
+    )
+    _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/services" |
+        Select-Object name, desc, state, 'active-state' |
+        Sort-Object state, name
+}
+
+function Get-PVENodePCI {
+    <#
+    .SYNOPSIS PCI devices available for passthrough on a node.
+    .EXAMPLE
+        Get-PVENodePCI -ClusterName THC -Node thclprhevh01
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][string]$Node
+    )
+    _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/hardware/pci" |
+        Select-Object id, class, vendor, device, iommugroup, subsystem_vendor, subsystem_device |
+        Sort-Object iommugroup, id
+}
+
+function Get-PVEVMPending {
+    <#
+    .SYNOPSIS Config changes pending reboot for a VM (live config vs stored config diff).
+    .EXAMPLE
+        Get-PVEVMPending -ClusterName THC -VMIDorName 'thcwpexch01'
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][Alias('VMID','Name')][string]$VMIDorName,
+        [string]$Node
+    )
+    if ($VMIDorName -match '^\d+$') {
+        $vmid = [int]$VMIDorName
+        if (-not $Node) { throw "Pass -Node when using VMID directly." }
+    } else {
+        $vm   = Get-PVEVMs -ClusterName $ClusterName -Name $VMIDorName | Select-Object -First 1
+        if (-not $vm) { throw "VM '$VMIDorName' not found." }
+        $vmid = $vm.VMID; if (-not $Node) { $Node = $vm.Node }
+    }
+    _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/qemu/$vmid/pending"
+}
+
+function Get-PVENodeCertificates {
+    <#
+    .SYNOPSIS TLS certificates on a node (expiry, fingerprint, issuer).
+    .EXAMPLE
+        Get-PVENodeCertificates -ClusterName THC -Node thclprhevh01
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][string]$Node
+    )
+    _PVE-Invoke -ClusterName $ClusterName -Path "/nodes/$Node/certificates/info" |
+        Select-Object filename, subject, issuer, fingerprint,
+            @{N='NotBefore';E={ [DateTimeOffset]::FromUnixTimeSeconds($_.notbefore).LocalDateTime.ToString('yyyy-MM-dd') }},
+            @{N='NotAfter'; E={ [DateTimeOffset]::FromUnixTimeSeconds($_.notafter).LocalDateTime.ToString('yyyy-MM-dd') }} |
+        Sort-Object filename
+}
+
+Export-ModuleMember -Function `
+    Get-PVENodes, Get-PVEVMs, Get-PVEVMDisk, Get-PVEVMsByStorage, Get-PVEStorage,
+    Get-PVEVMPowerState, Get-PVESnapshots,
+    Get-PVEVMConfig, Get-PVEVMStatus, Get-PVEClusterResources,
+    Get-PVELXCList, Get-PVENodeStatus, Get-PVENodeNetwork, Get-PVENodeDisks,
+    Get-PVEStorageContent, Get-PVEClusterTasks, Get-PVEBackupJobs,
+    Get-PVEHAStatus, Get-PVEReplicationJobs, Get-PVEFirewallRules,
+    Get-PVEVMAgent, Get-PVEVMRRDData, Get-PVENodeRRDData,
+    Get-PVENodeServices, Get-PVENodePCI, Get-PVEVMPending, Get-PVENodeCertificates

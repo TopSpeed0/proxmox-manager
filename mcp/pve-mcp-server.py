@@ -29,7 +29,7 @@ from typing import Any
 
 import mcp.server.stdio
 import mcp.types as types
-from mcp.server import Server
+from mcp.server import Server, NotificationOptions
 from mcp.server.models import InitializationOptions
 
 # ─────────────────────────────────────────────
@@ -155,6 +155,89 @@ def _get_vm_snapshots(node: str, vmid: int) -> list[dict]:
         return []
 
 
+def _get_lxc(node: str) -> list[dict]:
+    try: return _pve_request(f"/nodes/{node}/lxc") or []
+    except Exception: return []
+
+def _get_vm_status_live(node: str, vmid: int) -> dict:
+    return _pve_request(f"/nodes/{node}/qemu/{vmid}/status/current") or {}
+
+def _get_node_status(node: str) -> dict:
+    return _pve_request(f"/nodes/{node}/status") or {}
+
+def _get_node_network(node: str) -> list[dict]:
+    try: return _pve_request(f"/nodes/{node}/network") or []
+    except Exception: return []
+
+def _get_node_disks(node: str) -> list[dict]:
+    try: return _pve_request(f"/nodes/{node}/disks/list") or []
+    except Exception: return []
+
+def _get_storage_content(node: str, storage: str, ctype: str = "") -> list[dict]:
+    path = f"/nodes/{node}/storage/{storage}/content"
+    if ctype: path += f"?content={ctype}"
+    try: return _pve_request(path) or []
+    except Exception: return []
+
+def _get_cluster_resources(rtype: str = "") -> list[dict]:
+    path = "/cluster/resources"
+    if rtype: path += f"?type={rtype}"
+    try: return _pve_request(path) or []
+    except Exception: return []
+
+def _get_cluster_tasks(limit: int = 50) -> list[dict]:
+    try: return _pve_request(f"/cluster/tasks?limit={limit}") or []
+    except Exception: return []
+
+def _get_backup_jobs() -> list[dict]:
+    try: return _pve_request("/cluster/backup") or []
+    except Exception: return []
+
+def _get_ha_info() -> dict:
+    try:
+        return {"status": _pve_request("/cluster/ha/status/current") or {},
+                "resources": _pve_request("/cluster/ha/resources") or []}
+    except Exception as e:
+        return {"error": str(e)}
+
+def _get_replication_jobs() -> list[dict]:
+    try: return _pve_request("/cluster/replication") or []
+    except Exception: return []
+
+def _get_firewall_rules(node: str, vmid: int = 0) -> list[dict]:
+    try:
+        path = f"/nodes/{node}/qemu/{vmid}/firewall/rules" if vmid else f"/nodes/{node}/firewall/rules"
+        return _pve_request(path) or []
+    except Exception: return []
+
+def _get_agent_info(node: str, vmid: int) -> dict:
+    out = {}
+    for ep, k in [("network-get-interfaces","nics"),("get-osinfo","os"),("get-host-name","hostname")]:
+        try: out[k] = _pve_request(f"/nodes/{node}/qemu/{vmid}/agent/{ep}")
+        except Exception: out[k] = None
+    return out
+
+def _get_rrddata(path: str, timeframe: str = "hour") -> list[dict]:
+    try: return _pve_request(f"{path}?timeframe={timeframe}&cf=AVERAGE") or []
+    except Exception: return []
+
+def _get_node_services(node: str) -> list[dict]:
+    try: return _pve_request(f"/nodes/{node}/services") or []
+    except Exception: return []
+
+def _get_node_pci(node: str) -> list[dict]:
+    try: return _pve_request(f"/nodes/{node}/hardware/pci") or []
+    except Exception: return []
+
+def _get_vm_pending(node: str, vmid: int) -> list[dict]:
+    try: return _pve_request(f"/nodes/{node}/qemu/{vmid}/pending") or []
+    except Exception: return []
+
+def _get_node_certs(node: str) -> list[dict]:
+    try: return _pve_request(f"/nodes/{node}/certificates/info") or []
+    except Exception: return []
+
+
 # ─────────────────────────────────────────────
 # MCP Server
 # ─────────────────────────────────────────────
@@ -234,10 +317,108 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="pve_get_nodes",
             description="List all nodes in the Proxmox cluster with status, memory, and uptime.",
-            inputSchema={
-                "type": "object",
-                "properties": {}
-            }
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        # ── NEW TOOLS ──────────────────────────────────────────────────
+        types.Tool(
+            name="pve_get_vm_config",
+            description="Full VM config: CPU type, BIOS, boot order, NIC list, disk config, tags, description.",
+            inputSchema={"type":"object","properties":{"vm_name":{"type":"string","description":"VM name or VMID."}},"required":["vm_name"]}
+        ),
+        types.Tool(
+            name="pve_get_vm_status",
+            description="Live VM metrics: CPU%, RAM used/max, PID, uptime, QMP status, lock, tags.",
+            inputSchema={"type":"object","properties":{"vm_name":{"type":"string","description":"VM name or VMID."}},"required":["vm_name"]}
+        ),
+        types.Tool(
+            name="pve_get_cluster_resources",
+            description="All cluster resources in one bulk call: VMs, nodes, storage, LXC. Fast overview.",
+            inputSchema={"type":"object","properties":{"type":{"type":"string","enum":["vm","node","storage","sdn","all"],"default":"all","description":"Resource type filter."}}}
+        ),
+        types.Tool(
+            name="pve_list_lxc",
+            description="List LXC containers across all nodes (name, status, RAM, CPU, disk).",
+            inputSchema={"type":"object","properties":{"node":{"type":"string","description":"Filter to specific node (optional)."},"status_filter":{"type":"string","enum":["running","stopped","all"],"default":"all"}}}
+        ),
+        types.Tool(
+            name="pve_get_node_status",
+            description="Detailed node metrics: CPU%, RAM, swap, load averages, disk, kernel, PVE version.",
+            inputSchema={"type":"object","properties":{"node":{"type":"string","description":"Node name, e.g. thclprhevh01."}},"required":["node"]}
+        ),
+        types.Tool(
+            name="pve_get_node_network",
+            description="All NICs and bridges on a node: IP, netmask, gateway, MAC, bridge ports.",
+            inputSchema={"type":"object","properties":{"node":{"type":"string","description":"Node name."}},"required":["node"]}
+        ),
+        types.Tool(
+            name="pve_get_node_disks",
+            description="Physical disks on a node: model, serial, size, type, S.M.A.R.T. health, wear.",
+            inputSchema={"type":"object","properties":{"node":{"type":"string","description":"Node name."}},"required":["node"]}
+        ),
+        types.Tool(
+            name="pve_get_storage_content",
+            description="List content of a storage pool: VM images, ISOs, backups, templates.",
+            inputSchema={"type":"object","properties":{"node":{"type":"string"},"storage":{"type":"string"},"content_type":{"type":"string","enum":["images","iso","backup","vztmpl","all"],"default":"all"}},"required":["node","storage"]}
+        ),
+        types.Tool(
+            name="pve_get_cluster_tasks",
+            description="Cluster task history: migrations, backups, clones, snapshot operations.",
+            inputSchema={"type":"object","properties":{"limit":{"type":"integer","default":50,"description":"Max tasks to return."}}}
+        ),
+        types.Tool(
+            name="pve_get_backup_jobs",
+            description="List configured vzdump backup jobs: schedule, storage, VMs, compression, mode.",
+            inputSchema={"type":"object","properties":{}}
+        ),
+        types.Tool(
+            name="pve_get_ha_status",
+            description="HA cluster status and list of HA-managed resources.",
+            inputSchema={"type":"object","properties":{}}
+        ),
+        types.Tool(
+            name="pve_get_replication_jobs",
+            description="List VM replication jobs: source, target, schedule, rate, status.",
+            inputSchema={"type":"object","properties":{}}
+        ),
+        types.Tool(
+            name="pve_get_firewall_rules",
+            description="Firewall rules for a node or a specific VM.",
+            inputSchema={"type":"object","properties":{"node":{"type":"string","description":"Node name."},"vm_name":{"type":"string","description":"VM name/VMID for VM-level rules. Omit for node-level."}},"required":["node"]}
+        ),
+        types.Tool(
+            name="pve_get_vm_agent",
+            description="QEMU guest agent data: IP addresses, OS info, hostname. Requires agent installed inside VM.",
+            inputSchema={"type":"object","properties":{"vm_name":{"type":"string","description":"VM name or VMID."}},"required":["vm_name"]}
+        ),
+        types.Tool(
+            name="pve_get_vm_rrddata",
+            description="Historical metrics for a VM: CPU, RAM, net I/O, disk I/O over time.",
+            inputSchema={"type":"object","properties":{"vm_name":{"type":"string"},"timeframe":{"type":"string","enum":["hour","day","week","month","year"],"default":"hour"}},"required":["vm_name"]}
+        ),
+        types.Tool(
+            name="pve_get_node_rrddata",
+            description="Historical metrics for a node: CPU, RAM, net, disk over time.",
+            inputSchema={"type":"object","properties":{"node":{"type":"string"},"timeframe":{"type":"string","enum":["hour","day","week","month","year"],"default":"hour"}},"required":["node"]}
+        ),
+        types.Tool(
+            name="pve_get_node_services",
+            description="systemd services on a node: pveproxy, pvedaemon, pve-ha-*, corosync, etc.",
+            inputSchema={"type":"object","properties":{"node":{"type":"string","description":"Node name."}},"required":["node"]}
+        ),
+        types.Tool(
+            name="pve_get_node_pci",
+            description="PCI devices available for passthrough on a node (IOMMU groups, vendor, class).",
+            inputSchema={"type":"object","properties":{"node":{"type":"string","description":"Node name."}},"required":["node"]}
+        ),
+        types.Tool(
+            name="pve_get_vm_pending",
+            description="Config changes pending reboot for a VM (diff between live and stored config).",
+            inputSchema={"type":"object","properties":{"vm_name":{"type":"string","description":"VM name or VMID."}},"required":["vm_name"]}
+        ),
+        types.Tool(
+            name="pve_get_node_certificates",
+            description="TLS certificates on a node: subject, issuer, fingerprint, expiry dates.",
+            inputSchema={"type":"object","properties":{"node":{"type":"string","description":"Node name."}},"required":["node"]}
         ),
     ]
 
@@ -265,6 +446,48 @@ async def _dispatch(name: str, args: dict) -> Any:
         return _tool_get_storage()
     elif name == "pve_get_snapshots":
         return _tool_get_snapshots(args.get("vm_name", ""))
+    elif name == "pve_get_vm_config":
+        return _tool_get_vm_config(args["vm_name"])
+    elif name == "pve_get_vm_status":
+        return _tool_get_vm_status(args["vm_name"])
+    elif name == "pve_get_cluster_resources":
+        return _get_cluster_resources(args.get("type", ""))
+    elif name == "pve_list_lxc":
+        return _tool_list_lxc(args.get("node", ""), args.get("status_filter", "all"))
+    elif name == "pve_get_node_status":
+        return _get_node_status(args["node"])
+    elif name == "pve_get_node_network":
+        return _get_node_network(args["node"])
+    elif name == "pve_get_node_disks":
+        return _get_node_disks(args["node"])
+    elif name == "pve_get_storage_content":
+        return _get_storage_content(args["node"], args["storage"], args.get("content_type", ""))
+    elif name == "pve_get_cluster_tasks":
+        return _get_cluster_tasks(args.get("limit", 50))
+    elif name == "pve_get_backup_jobs":
+        return _get_backup_jobs()
+    elif name == "pve_get_ha_status":
+        return _get_ha_info()
+    elif name == "pve_get_replication_jobs":
+        return _get_replication_jobs()
+    elif name == "pve_get_firewall_rules":
+        return _tool_get_firewall_rules(args["node"], args.get("vm_name", ""))
+    elif name == "pve_get_vm_agent":
+        return _tool_get_vm_agent(args["vm_name"])
+    elif name == "pve_get_vm_rrddata":
+        node, vmid, _ = _resolve_vm(args["vm_name"])
+        return _get_rrddata(f"/nodes/{node}/qemu/{vmid}/rrddata", args.get("timeframe", "hour"))
+    elif name == "pve_get_node_rrddata":
+        return _get_rrddata(f"/nodes/{args['node']}/rrddata", args.get("timeframe", "hour"))
+    elif name == "pve_get_node_services":
+        return _get_node_services(args["node"])
+    elif name == "pve_get_node_pci":
+        return _get_node_pci(args["node"])
+    elif name == "pve_get_vm_pending":
+        node, vmid, _ = _resolve_vm(args["vm_name"])
+        return _get_vm_pending(node, vmid)
+    elif name == "pve_get_node_certificates":
+        return _get_node_certs(args["node"])
     else:
         raise ValueError(f"Unknown tool: {name}")
 
@@ -402,6 +625,74 @@ def _tool_get_snapshots(vm_name: str = "") -> list[dict]:
     return sorted(results, key=lambda x: (x["vm"], x["created"]))
 
 
+def _tool_get_vm_config(vm_name: str) -> dict:
+    node, vmid, name = _resolve_vm(vm_name)
+    cfg = _get_vm_config(node, vmid)
+    cfg["_vm_name"] = name
+    cfg["_node"]    = node
+    cfg["_vmid"]    = vmid
+    return cfg
+
+
+def _tool_get_vm_status(vm_name: str) -> dict:
+    node, vmid, name = _resolve_vm(vm_name)
+    s = _get_vm_status_live(node, vmid)
+    maxmem = s.get("maxmem", 1) or 1
+    return {
+        "name":       name,
+        "vmid":       vmid,
+        "node":       node,
+        "status":     s.get("status"),
+        "cpu_pct":    round(s.get("cpu", 0) * 100, 2),
+        "mem_used_gb":round(s.get("mem", 0) / 1e9, 2),
+        "mem_max_gb": round(s.get("maxmem", 0) / 1e9, 1),
+        "mem_pct":    round(s.get("mem", 0) / maxmem * 100, 1),
+        "uptime_h":   round(s.get("uptime", 0) / 3600, 1),
+        "pid":        s.get("pid"),
+        "lock":       s.get("lock"),
+        "qmpstatus":  s.get("qmpstatus"),
+        "tags":       s.get("tags"),
+    }
+
+
+def _tool_list_lxc(node_filter: str = "", status_filter: str = "all") -> list[dict]:
+    import fnmatch
+    nodes = _get_nodes()
+    results = []
+    for n in nodes:
+        nname = n.get("node", "")
+        if node_filter and not fnmatch.fnmatch(nname, node_filter):
+            continue
+        for c in _get_lxc(nname):
+            st = c.get("status", "")
+            if status_filter != "all" and st != status_filter:
+                continue
+            results.append({
+                "node":     nname,
+                "ctid":     c.get("vmid"),
+                "name":     c.get("name"),
+                "status":   st,
+                "mem_gb":   round(c.get("maxmem", 0) / 1e9, 1),
+                "cpus":     c.get("cpus"),
+                "disk_gb":  round(c.get("maxdisk", 0) / 1e9, 1),
+                "uptime_h": round(c.get("uptime", 0) / 3600, 1),
+            })
+    return sorted(results, key=lambda x: (x["node"], x["name"] or ""))
+
+
+def _tool_get_firewall_rules(node: str, vm_name: str = "") -> list[dict]:
+    vmid = 0
+    if vm_name:
+        _, vmid, _ = _resolve_vm(vm_name)
+    return _get_firewall_rules(node, vmid)
+
+
+def _tool_get_vm_agent(vm_name: str) -> dict:
+    node, vmid, name = _resolve_vm(vm_name)
+    info = _get_agent_info(node, vmid)
+    return {"vm": name, "vmid": vmid, "node": node, **info}
+
+
 # ─────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────
@@ -415,7 +706,7 @@ async def _run_stdio():
                 server_name="proxmox-manager",
                 server_version="1.0.0",
                 capabilities=server.get_capabilities(
-                    notification_options=None,
+                    notification_options=NotificationOptions(),
                     experimental_capabilities={}
                 ),
             ),

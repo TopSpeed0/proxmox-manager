@@ -1,3 +1,19 @@
-*.key
+# Secrets & credentials
+credentials/
 *.cred
-/Config/nodes.json
+aes.key
+
+# Test output (may contain real cluster data)
+out/
+
+# Config with real IPs/hostnames
+Config/nodes.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# VS Code
+.vscode/

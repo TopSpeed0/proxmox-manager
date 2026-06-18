@@ -15,6 +15,17 @@ $script:PVEConfigPath  = Join-Path $PSScriptRoot '..\Config\nodes.json'
 $script:PVECredPath    = Join-Path $PSScriptRoot '..\credentials'
 $script:PVEAesKeyPath  = Join-Path $PSScriptRoot '..\credentials\aes.key'
 
+# PS 5.1 does not support -SkipCertificateCheck — bypass via callback instead
+if (-not ([System.Management.Automation.PSTypeName]'TrustAllCerts').Type) {
+    Add-Type -TypeDefinition @'
+using System.Net; using System.Security.Cryptography.X509Certificates;
+public class TrustAllCerts : ICertificatePolicy {
+    public bool CheckValidationResult(ServicePoint sp, X509Certificate c, WebRequest r, int e) { return true; }
+}
+'@
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCerts
+}
+
 # ──────────────────────────────────────────────
 # Internal helpers
 # ──────────────────────────────────────────────
@@ -51,12 +62,10 @@ function _PVE-Invoke {
 
     $uri    = "$($conn.BaseUrl)$Path"
     $params = @{
-        Uri                  = $uri
-        Method               = $Method
-        Headers              = $conn.Headers
-        ContentType          = 'application/json'
-        SkipCertificateCheck = $true
-        SkipHeaderValidation = $true
+        Uri         = $uri
+        Method      = $Method
+        Headers     = $conn.Headers
+        ContentType = 'application/json'
     }
     if ($Body) { $params['Body'] = ($Body | ConvertTo-Json -Depth 5) }
 
@@ -121,7 +130,7 @@ function Connect-PVECluster {
     $headers = @{ Authorization = "PVEAPIToken=${tokenUser}!${tokenId}=${Token}" }
 
     # Test connection
-    $test = Invoke-RestMethod -Uri "$baseUrl/version" -Headers $headers -Method GET -SkipCertificateCheck -SkipHeaderValidation
+    $test = Invoke-RestMethod -Uri "$baseUrl/version" -Headers $headers -Method GET
     if (-not $test.data.version) { throw "Connection test failed for $baseUrl" }
 
     $script:PVEConnections[$Name] = @{
